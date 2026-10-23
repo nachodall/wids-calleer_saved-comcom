@@ -1,5 +1,6 @@
 // Placa A (el oido) - Fase A2: captura + parser de frames 802.11.
-// Arranca WiFi + ESP-NOW (base de espnow_chat), prende el modo promiscuo y salta
+// Arranca WiFi + ESP-NOW (base de espnow_chat), prende el modo centinela (modo
+// promiscuo en jerga 802.11: la radio entrega todos los frames del aire) y salta
 // de canal 1..13. De cada frame lee el "frame control" para sacar tipo y subtipo,
 // y clasifica: beacon, deauth, disassoc u otros. De cada beacon saca el nombre de
 // red (SSID), la MAC del AP (BSSID) y el RSSI, y arma una lista de redes vistas
@@ -157,7 +158,7 @@ void app_main(void)
 
     ESP_ERROR_CHECK(esp_wifi_set_promiscuous(true));
     ESP_ERROR_CHECK(esp_wifi_set_promiscuous_rx_cb(promisc_cb));
-    printf("promiscuo ON | RAM libre: %u bytes\n", (unsigned)esp_get_free_heap_size());
+    printf("modo centinela ON | RAM libre: %u bytes\n", (unsigned)esp_get_free_heap_size());
 
     xTaskCreate(hop_task, "hop", 2048, NULL, 4, NULL);
 
