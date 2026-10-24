@@ -15,7 +15,7 @@
 // Canal donde la Placa B (consola) escucha ESP-NOW, fijo. La Placa A salta de
 // canal para capturar, pero antes de mandar una alerta se fija en este canal,
 // manda, y vuelve a saltar. Las dos placas tienen que usar el mismo numero.
-#define ESPNOW_CANAL   1
+#define ESPNOW_CANAL   10
 
 // Flujo de una sola via: A manda, B recibe. B nunca le contesta a A.
 // En el aire va [TEAM_TAG][evento_t]. B descarta lo que no empieza con TEAM_TAG
