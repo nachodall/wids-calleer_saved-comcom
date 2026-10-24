@@ -1,101 +1,148 @@
-# Primera demo de la consola B: B1 + joystick
+# Consola B: menú, historial y alertas animadas
 
-Proyecto ESP-IDF independiente del firmware principal, para ESP32-S3 y OLED
-SSD1306 SPI. Implementa únicamente la pantalla de alerta B1 y diagnóstico
-del joystick. No incluye historial, ACK, tabla de dispositivos ni sonido.
-Esta demo corresponde a B1 de `PLACA_B_CONSOLA.md`; la fase 1 general de
-`IMPLEMENTACION.md` (captura WiFi de la Placa A) es una fase diferente.
+Firmware ESP-IDF para ESP32-S3 y OLED SSD1306 SPI de **128×64**. Recibe
+alertas reales de la Placa A por ESP-NOW. Se inicia en el menú principal.
 
-## Ejecutar
+## Compilar y cargar
 
 ```bash
-cd /home/valenrc/esp-idf
-. ./export.sh
-cd wids-calleer_saved-comcom/demos/fase1_joystick
-idf.py flash monitor
+. /home/valenrc/esp-idf/export.sh
+cd /home/valenrc/esp-idf/wids-calleer_saved-comcom/placa_b_consola
+idf.py build
+idf.py -p /dev/ttyACM0 flash monitor
 ```
 
-Para elegir puerto: `idf.py -p /dev/ttyACM0 flash monitor`.
-Usar USB nativo Serial/JTAG. Salir con `Ctrl+]`.
+Seleccionar el puerto de la **Placa B**. USB nativo Serial/JTAG; salir del
+monitor con `Ctrl+]`. PSRAM deshabilitada. Los binarios conservan el nombre
+`wids_demo_fase1_joystick` por compatibilidad con el proyecto existente.
 
-## Pantalla de alerta B1
+## Navegación
 
-Al arrancar muestra **ESPERA** y `ESP-NOW CH:13`; permanece esperando hasta
-recibir una alerta real. No genera eventos sintéticos, ni hay una opción de
-configuración que pueda activarlos. El diagnóstico del joystick sigue visible.
+No hace falta un botón central: **arriba/abajo seleccionan, derecha entra e
+izquierda vuelve**. Una acción por movimiento; soltar antes de repetir.
+Las ayudas de cada pantalla recuerdan los controles.
 
-Recibe eventos ESP-NOW en `ESPNOW_CANAL` con el contrato
-`[TEAM_TAG][evento_t]` de `../../../evento.h`: 58 bytes, canal **13** y tag NCH1.
-La Placa A debe transmitir por broadcast en ese mismo canal y compilar el
-mismo contrato. El campo `evento_t.canal` identifica el canal del ataque y
-puede ser distinto del canal 13 usado para transportar la alerta.
+| Pantalla | Función y controles |
+|---|---|
+| Menú | Monitor, Historial, Joystick y Estado radio. Arriba/abajo recorren las opciones; derecha abre. |
+| Monitor | Última alerta, tipo, severidad, canal observado, RSSI e intensidad. Arriba/abajo alternan las dos páginas; derecha abre el historial. |
+| Historial | Últimas **32 alertas**, de más reciente a más antigua, con tipo, severidad y antigüedad local. Arriba/abajo seleccionan; derecha abre el detalle. |
+| Detalle desde historial | Conserva el evento seleccionado; izquierda vuelve a la misma posición de la lista. |
+| Joystick | Diagnóstico de las cuatro entradas: GPIO, nivel crudo, nivel estable y pulsaciones. Izquierda vuelve al menú. |
+| Estado radio | Canal, tag, eventos procesados, registros guardados y descartes por cola llena. Izquierda vuelve. |
 
-Al recibir un paquete válido, el encabezado cambia a `RX`. Muestra tipo,
-severidad, canal observado, RSSI, intensidad y BSSID (DEAUTH) o SSID (EVIL TWIN,
-hasta 21 caracteres en pantalla; completo por serie). Solo conserva la alerta
-más reciente y no transmite respuestas. No detecta ataques por sí misma.
+El detalle de DEAUTH muestra BSSID y MAC de la víctima. EVIL TWIN muestra el
+SSID completo, distribuido en dos líneas (hasta 32 bytes), BSSID y el tiempo
+original de la Placa A. El OLED representa caracteres no ASCII como `?`.
+`FPS` es la intensidad de DEAUTH; `SC`, el score de EVIL TWIN.
 
-Los paquetes de longitud, tag, tipo, canal observado o severidad inválidos
-se descartan. El tráfico WiFi ajeno no se convierte en eventos. El tag separa
-equipos; no autentica al emisor.
+**El historial está en RAM: se borra al reiniciar.** Al superar 32 registros,
+se reemplaza el más antiguo. La antigüedad se calcula desde la recepción en B,
+en segundos, minutos, horas o días, sin sincronizar los relojes de las placas.
 
-`../../../radio_config.h` configura Argentina, canales 1–13, y verifica que
-la radio haya quedado en el canal 13. El monitor imprime la MAC receptora y
-`ESPERANDO ALERTA REAL` al arrancar; cada recepción válida imprime `ESP-NOW RX`.
+## Aviso de una alerta nueva
 
-La radio usa HT20 y verifica el canal principal con reintentos acotados. El log
-`Canal solicitado=13 principal=13 secundario=... HT20` confirma la configuración.
-Si no consigue el canal correcto, muestra `ERROR RADIO` sin reiniciar y permite
-seguir probando el joystick; revisar los valores reales en el monitor serie.
+Una alerta interrumpe cualquier pantalla y abre un aviso de **2,2 segundos**:
+cabecera invertida, tipo en letras grandes, esquinas que se abren con
+desaceleración, severidad/canal y barra temporal. Después aparece el detalle.
+Mover el joystick permite saltar inmediatamente al detalle; ese primer gesto
+solo cierra la animación. No hay destellos de pantalla completa.
 
-## Diagnóstico del joystick
+El aviso se dibuja a un objetivo de **25 FPS**, sin pausas de animación que
+bloqueen el bucle. Mientras está activo se sigue leyendo el joystick y
+procesando alertas. Las alertas de una ráfaga se guardan y actualizan el aviso
+con la más reciente sin reiniciar su temporizador mientras está activo.
+La recepción usa una cola FIFO de 32 elementos; si se llena, descarta el nuevo
+evento y aumenta `COLA PERDIDOS` en Estado radio. Este contador no incluye
+pérdidas del enlace inalámbrico.
 
-Las cuatro filas inferiores permanecen visibles junto a la alerta:
+## LED de alerta y debug SW2
 
-| Dirección | Señal | GPIO |
-|---|---|---|
-| R / derecha | KEY_RIGHT | IO10 |
-| D / abajo | KEY_DOWN | IO11 |
-| L / izquierda | KEY_LEFT | IO12 |
-| U / arriba | KEY_UP | IO9 |
+El LED conectado a **IO1** se controla con nivel bajo: 0 encendido, 1
+apagado. Arranca apagado. Cada alerta válida DEAUTH o EVIL TWIN procesada
+lo enciende durante **2,2 segundos**; una alerta nueva renueva ese plazo.
+Cerrar la animación con el joystick no apaga anticipadamente el LED.
 
-Cada fila muestra `R` (nivel crudo), `S` (nivel estable con antirrebote de
-40 ms) y `N` (pulsaciones confirmadas). Son entradas con pull-up: **0 pulsado,
-1 suelto**. Se muestrean cada 10 ms; movimientos simultáneos se muestran
-independientemente. El joystick solo diagnostica entradas, no cambia de modo.
+**SW2 (IO21)** permite probarlo: mantener presionado enciende el LED y
+soltarlo lo apaga, salvo que siga vigente el plazo de una alerta.
+SW2 es activo en bajo, con pull-up interno y antirrebote de 40 ms.
+Funciona en todas las pantallas, incluso si falló la fijación del canal de
+radio. La prueba solo controla el LED; no agrega alertas al historial.
+El monitor serie muestra los cambios de SW2 y los estados IO1 ON/OFF.
 
-Se compensa el montaje girado **135° a la izquierda**, visto desde el OLED,
-mediante el mismo `../../../joystick_orientation.h` que usa la consola principal.
-El encabezado indica la dirección corregida; `UP-L`, `UP-R`, `DOWN-L` y `DOWN-R`
-son diagonales. Las filas RAW/ESTABLE conservan los GPIO y etiquetas originales.
+Para verificar en placa: mantener SW2 y soltarlo; luego recibir una alerta
+de cada tipo y comprobar que el LED se apaga tras 2,2 segundos sin nuevas
+alertas. Si se suelta SW2 durante ese intervalo, debe permanecer encendido
+hasta que termine.
 
-| Contactos activos (nivel 0) | Dirección corregida |
+## Radio y contrato
+
+La fuente del contrato es [`../shared/evento.h`](../shared/evento.h):
+`[TEAM_TAG][evento_t]`, **58 bytes**, tag `NCH1`. El canal de transporte lo fija
+`ESPNOW_CANAL` (**10** actualmente); ambas placas deben compilar el mismo valor.
+El campo `evento_t.canal` es el canal observado del ataque y puede ser distinto.
+
+Se descartan longitudes, tags, tipos, canales observados o severidades
+inválidos. El firmware no genera eventos de prueba ni responde a la Placa A.
+El tag separa equipos, no autentica al emisor. `LISTA` indica que el receptor
+se inicializó, no que exista un enlace confirmado con A.
+
+El monitor serie imprime la MAC receptora al iniciar y `ESP-NOW RX` por cada
+alerta procesada. Si falla la fijación del canal, el menú indica `ERROR` y
+Estado radio muestra el error; el joystick continúa disponible.
+
+## Cableado y orientación
+
+OLED: SCK **36**, MOSI **37**, CS **38**, DC **39**, RST **40**.
+Joystick: contactos R **10**, D **11**, L **12**, U **9**, activos en bajo con
+pull-up (`0` pulsado, `1` suelto). Muestreo cada 10 ms; antirrebote de 40 ms.
+
+Se compensa el montaje girado **135° a la izquierda**, visto desde el OLED:
+
+| Contactos activos | Dirección del menú |
 |---|---|
 | IO10 + IO11 | Arriba |
 | IO11 + IO12 | Derecha |
 | IO12 + IO9 | Abajo |
 | IO9 + IO10 | Izquierda |
+| IO10 solo | Izquierda |
+| IO11 solo | Arriba |
+| IO12 solo | Derecha |
+| IO9 solo | Abajo |
 
-Un solo contacto produce una diagonal: IO10 arriba-izquierda, IO11
-arriba-derecha, IO12 abajo-derecha e IO9 abajo-izquierda. El monitor imprime
-`CORREGIDO 135 IZQ` y la acción `MENU` que usaría la consola. Para resolver
-empates diagonales en un menú de cuatro direcciones: IO10 → izquierda,
-IO11 → arriba, IO12 → derecha, IO9 → abajo. Se esperan 40 ms para agrupar
-contactos vecinos; mantener pulsado o liberar parcialmente no repite la acción.
+Se esperan otros 40 ms para agrupar contactos vecinos. Mantener el joystick
+o liberar parcialmente una combinación no dispara acciones adicionales.
+El diagnóstico conserva los nombres físicos y muestra la dirección corregida
+en la cabecera; el monitor serie conserva RAW, PRESS y RELEASE.
 
-El monitor imprime cada cambio crudo (`RAW`), pulsación (`PRESS`) y liberación
-(`RELEASE`), con dirección, GPIO y contadores. Cada segundo imprime los niveles
-de las cuatro entradas para detectar una dirección trabada o cableado incorrecto.
-Los flancos crudos permiten observar rebotes de duración mayor al muestreo;
-no sustituye una medición con osciloscopio.
+## Verificación
 
-Prueba manual:
+Desde la raíz del repositorio, pruebas en host sin hardware:
 
-1. En reposo, todas las entradas deben mostrar `R1 S1`.
-2. Pulsar cada dirección: solo su fila pasa a `R0 S0` y `N` sube una vez.
-3. Mantener pulsado: `N` no debe seguir subiendo.
-4. Soltar: vuelve a `R1 S1` y aparece `RELEASE` en serie.
-5. Comparar el GPIO indicado con el movimiento físico para detectar cruces.
+```bash
+cc -std=c11 -Wall -Wextra -Werror -fsanitize=address,undefined -g \
+  -Iplaca_b_consola/main -Ishared tests/test_placa_b_ui.c \
+  placa_b_consola/main/console_ui.c -o /tmp/test_placa_b_ui
+ASAN_OPTIONS=detect_leaks=0 /tmp/test_placa_b_ui
+cc -std=c11 -Wall -Wextra -Werror -Iplaca_b_consola/main \
+  tests/test_joystick_orientation.c -o /tmp/test_placa_b_joystick
+/tmp/test_placa_b_joystick
+```
 
-Pines OLED: SCK 36, MOSI 37, CS 38, DC 39, RST 40. PSRAM deshabilitada.
-Compilar con `idf.py build`; validar pantalla, radio y GPIO en la placa física.
+Cubren navegación vacía, límites del historial, orden tras 70 eventos, vuelta
+al registro seleccionado, interrupción de todas las pantallas, ráfagas,
+fin/cancelación de animación, reloj más allá de 32 bits, SSID sin terminador
+y límites del framebuffer. Se desactiva únicamente LeakSanitizer para poder
+usar las pruebas en entornos con ptrace; se mantienen ASan y UBSan.
+
+Para generar capturas y animación del **mismo renderizador del firmware**
+(con eventos sintéticos exclusivamente en el programa de pruebas del host):
+
+```bash
+python3 tests/preview_placa_b.py /tmp/placa-b-preview
+```
+
+Prueba en placa: recorrer el menú, recibir DEAUTH y EVIL TWIN reales, abrir
+un registro antiguo, comprobar que otra alerta interrumpe esa vista, saltar
+el aviso con el joystick y verificar el detalle en el OLED. Confirmar también
+que cada gesto navega una sola vez y que el historial se vacía al reiniciar.

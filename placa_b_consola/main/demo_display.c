@@ -9,7 +9,6 @@
 #include "esp_lcd_panel_ops.h"
 #include "esp_lcd_panel_ssd1306.h"
 #include "demo_display.h"
-#include "font5x7.h"
 
 #define PIN_SCK 36
 #define PIN_MOSI 37
@@ -23,7 +22,6 @@
 static uint8_t fb[LCD_W * LCD_H / 8];
 static esp_lcd_panel_handle_t panel;
 static SemaphoreHandle_t flush_done;
-static void draw_text(int x0, int y0, const char *s);
 
 
 // ---------- display ----------
@@ -88,52 +86,10 @@ void demo_display_init(void)
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(panel, true));
 }
 
-// Prende el pixel (x, y) en el framebuffer fb. No toca el display: hay que
-// llamar a redraw() para verlo. Ignora coordenadas fuera de la pantalla.
-// El OLED agrupa 8 filas por byte (bit 0 = fila de arriba), de ahi el y / 8.
-static void set_pixel(int x, int y)
+// El driver conserva su buffer hasta que termina la transferencia SPI.
+void demo_display_draw(const uint8_t frame[UI_FRAME_BYTES])
 {
-    if (x < 0 || x >= LCD_W || y < 0 || y >= LCD_H) {
-        return;
-    }
-    fb[(y / 8) * LCD_W + x] |= 1 << (y % 8);
-}
-
-// Dibuja el texto s en el framebuffer con la fuente 5x7, desde (x0, y0).
-// Cada letra ocupa 6 px de ancho (5 + 1 de espacio) y cada fila 9 px de alto.
-// Recorta al borde de la pantalla. Los caracteres fuera de ASCII 32..126
-// salen como '?', incluidos SSID binarios o UTF-8.
-static void draw_text(int x0, int y0, const char *s)
-{
-    int x = x0, y = y0;
-    for (; *s; s++, x += 6) {
-        if (x + 5 > LCD_W) {
-            return;
-        }
-        if (y + 7 > LCD_H) {
-            return;
-        }
-        char c = (*s < 32 || *s > 126) ? '?' : *s;
-        const uint8_t *g = FONT[c - 32];
-        for (int col = 0; col < 5; col++) {
-            for (int row = 0; row < 7; row++) {
-                if (g[col] & (1 << row)) {
-                    set_pixel(x + col, y + row);
-                }
-            }
-        }
-    }
-}
-
-void demo_display_draw(const char *const lines[7])
-{
-    memset(fb, 0, sizeof(fb));
-    for (int row = 0; row < 7; row++) {
-        draw_text(0, row * 9, lines[row]);
-    }
-    for (size_t col = 0; col < LCD_W; col++) {
-        fb[col] ^= 0xff;
-    }
+    memcpy(fb, frame, sizeof(fb));
     ESP_ERROR_CHECK(esp_lcd_panel_draw_bitmap(panel, 0, 0, LCD_W, LCD_H, fb));
     ESP_ERROR_CHECK(xSemaphoreTake(flush_done, pdMS_TO_TICKS(1000)) == pdTRUE
                     ? ESP_OK : ESP_ERR_TIMEOUT);

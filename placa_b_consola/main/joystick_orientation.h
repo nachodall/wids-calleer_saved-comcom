@@ -1,94 +1,77 @@
-// Correccion de orientacion del joystick para la Placa B (consola). RECONSTRUIDO a
-// partir del uso en demo_main.c/joystick.c y de la tabla del README (el archivo
-// original no estaba en el repo). El joystick esta montado girado 135 grados a la
-// izquierda visto desde el OLED, asi que el contacto fisico no coincide con la
-// direccion real en pantalla; este header hace esa correccion.
-//
-// OJO: las cadenas y valores exactos son una reconstruccion razonable a partir del
-// comportamiento documentado, no el archivo original del autor de la demo. Antes de
-// confiar en el texto exacto que imprime, reconciliar con su version si la recupera.
+// Orientacion 135 grados y agrupacion de contactos para el menu de la consola.
 #pragma once
-
+#include <stdbool.h>
 #include <stdint.h>
-#include "joystick.h"
 
-// Bits de contacto fisico (uno por pin), en el mismo orden que el enum JOY_* de
-// joystick.h: RIGHT=IO10, DOWN=IO11, LEFT=IO12, UP=IO9 (nombres de pin, no de
-// pantalla: estan girados 135 grados).
-#define JOY_HW_RIGHT  (1u << JOY_RIGHT)
-#define JOY_HW_DOWN   (1u << JOY_DOWN)
-#define JOY_HW_LEFT   (1u << JOY_LEFT)
-#define JOY_HW_UP     (1u << JOY_UP)
+// Bits de contactos fisicos, antes de corregir el montaje.
+enum { JOY_HW_RIGHT = 1, JOY_HW_DOWN = 2, JOY_HW_LEFT = 4, JOY_HW_UP = 8 };
+typedef struct { int x; int y; } joystick_vector_t;
 
-// Accion de menu que puede producir un gesto del joystick.
-typedef enum {
-    JOY_MENU_NONE = 0,
-    JOY_MENU_UP,
-    JOY_MENU_DOWN,
-    JOY_MENU_LEFT,
-    JOY_MENU_RIGHT,
-} joystick_menu_t;
+// Montaje girado 135 grados antihorario respecto de la pantalla.
+// Coordenadas de pantalla: +x derecha, +y abajo. Una tecla fisica queda
+// diagonal; dos contactos vecinos forman una direccion cardinal corregida.
+static inline joystick_vector_t joystick_correct(uint8_t contacts)
+{
+    int x = !!(contacts & JOY_HW_RIGHT) - !!(contacts & JOY_HW_LEFT);
+    int y = !!(contacts & JOY_HW_DOWN) - !!(contacts & JOY_HW_UP);
+    return (joystick_vector_t){ .x = -x + y, .y = -x - y };
+}
 
-// Estado minimo para detectar flancos de contacto (evita repetir la accion
-// mientras se mantiene apretado o al soltar parcialmente un combo).
-typedef struct {
-    uint8_t last_contacts;
-} joystick_gesture_t;
-
-// Texto de diagnostico (para el log "CORREGIDO 135 IZQ: %s"): nombra la direccion
-// real en pantalla ya corregida. Dos contactos vecinos = cardinal; un solo
-// contacto = diagonal (por el giro de 135 grados no hay un cardinal puro).
 static inline const char *joystick_direction(uint8_t contacts)
 {
-    switch (contacts) {
-        case JOY_HW_RIGHT | JOY_HW_DOWN:  return "UP";      // IO10+IO11 -> arriba
-        case JOY_HW_DOWN  | JOY_HW_LEFT:  return "RIGHT";   // IO11+IO12 -> derecha
-        case JOY_HW_LEFT  | JOY_HW_UP:    return "DOWN";    // IO12+IO9  -> abajo
-        case JOY_HW_UP    | JOY_HW_RIGHT: return "LEFT";    // IO9+IO10  -> izquierda
-        case JOY_HW_RIGHT: return "UP-L";                   // IO10 solo -> arriba-izq
-        case JOY_HW_DOWN:  return "UP-R";                   // IO11 solo -> arriba-der
-        case JOY_HW_LEFT:  return "DOWN-R";                 // IO12 solo -> abajo-der
-        case JOY_HW_UP:    return "DOWN-L";                 // IO9  solo -> abajo-izq
-        default: return "-";                                 // nada o combo invalido
-    }
+    joystick_vector_t v = joystick_correct(contacts);
+    if (v.y < 0) return v.x < 0 ? "UP-LEFT" : v.x > 0 ? "UP-RIGHT" : "UP";
+    if (v.y > 0) return v.x < 0 ? "DOWN-LEFT" : v.x > 0 ? "DOWN-RIGHT" : "DOWN";
+    return v.x < 0 ? "LEFT" : v.x > 0 ? "RIGHT" : "CENTER";
 }
 
-// Version corta para la cabecera de la pantalla OLED (espacio limitado).
 static inline const char *joystick_screen_direction(uint8_t contacts)
 {
-    switch (contacts) {
-        case JOY_HW_RIGHT | JOY_HW_DOWN:  return "U";
-        case JOY_HW_DOWN  | JOY_HW_LEFT:  return "R";
-        case JOY_HW_LEFT  | JOY_HW_UP:    return "D";
-        case JOY_HW_UP    | JOY_HW_RIGHT: return "L";
-        case JOY_HW_RIGHT: return "UL";
-        case JOY_HW_DOWN:  return "UR";
-        case JOY_HW_LEFT:  return "DR";
-        case JOY_HW_UP:    return "DL";
-        default: return "-";
-    }
+    joystick_vector_t v = joystick_correct(contacts);
+    if (v.y < 0) return v.x < 0 ? "UP-L" : v.x > 0 ? "UP-R" : "UP";
+    if (v.y > 0) return v.x < 0 ? "DOWN-L" : v.x > 0 ? "DOWN-R" : "DOWN";
+    return v.x < 0 ? "LEFT" : v.x > 0 ? "RIGHT" : "CENTER";
 }
 
-// Resuelve un solo contacto a una direccion cardinal de menu (sin diagonales),
-// segun la tabla de desempate del README: IO10->izquierda, IO11->arriba,
-// IO12->derecha, IO9->abajo. Dos contactos simultaneos no navegan el menu (se
-// reservan para gestos futuros); solo un pin estable a la vez dispara una accion.
-static inline joystick_menu_t joystick_menu_poll(joystick_gesture_t *g, uint8_t contacts, uint32_t now_ms)
+enum { JOY_MENU_NONE, JOY_MENU_UP, JOY_MENU_DOWN, JOY_MENU_LEFT, JOY_MENU_RIGHT };
+
+static inline int joystick_menu_direction(uint8_t contacts)
 {
-    (void)now_ms;
-    if (contacts == g->last_contacts) {
-        return JOY_MENU_NONE;              // sin cambio: ni flanco de apretado ni de soltado
+    joystick_vector_t v = joystick_correct(contacts);
+    // A 135 grados hay empates exactos entre dos cardinales. Resolverlos
+    // siempre hacia el siguiente cardinal antihorario conserva las cuatro
+    // acciones incluso si el joystick solo permite cerrar un contacto.
+    if (v.x < 0 && v.y < 0) return JOY_MENU_LEFT;
+    if (v.x > 0 && v.y < 0) return JOY_MENU_UP;
+    if (v.x > 0 && v.y > 0) return JOY_MENU_RIGHT;
+    if (v.x < 0 && v.y > 0) return JOY_MENU_DOWN;
+    if (v.y < 0) return JOY_MENU_UP;
+    if (v.y > 0) return JOY_MENU_DOWN;
+    if (v.x < 0) return JOY_MENU_LEFT;
+    if (v.x > 0) return JOY_MENU_RIGHT;
+    return JOY_MENU_NONE;
+}
+
+typedef struct {
+    uint8_t contacts;
+    uint32_t changed_ms;
+    bool consumed;
+} joystick_gesture_t;
+
+// Espera 40 ms adicionales para agrupar dos contactos vecinos. Una accion
+// por gesto; la liberacion parcial no dispara una direccion diferente.
+static inline int joystick_menu_poll(joystick_gesture_t *gesture, uint8_t contacts, uint32_t now)
+{
+    if (contacts != gesture->contacts) {
+        gesture->contacts = contacts;
+        gesture->changed_ms = now;
     }
-    uint8_t before = g->last_contacts;
-    g->last_contacts = contacts;
-    if (before != 0 || contacts == 0) {
-        return JOY_MENU_NONE;              // solo dispara en el flanco 0 -> un solo pin
+    if (now - gesture->changed_ms < 40) return JOY_MENU_NONE;
+    if (contacts == 0) {
+        gesture->consumed = false;
+        return JOY_MENU_NONE;
     }
-    switch (contacts) {
-        case JOY_HW_RIGHT: return JOY_MENU_LEFT;
-        case JOY_HW_DOWN:  return JOY_MENU_UP;
-        case JOY_HW_LEFT:  return JOY_MENU_RIGHT;
-        case JOY_HW_UP:    return JOY_MENU_DOWN;
-        default:           return JOY_MENU_NONE;   // combo de 2+ pines: no navega el menu
-    }
+    if (gesture->consumed) return JOY_MENU_NONE;
+    gesture->consumed = true;
+    return joystick_menu_direction(contacts);
 }
