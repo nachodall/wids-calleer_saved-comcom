@@ -7,15 +7,17 @@
 //    un umbral bajo, alerta.
 //  - EVIL TWIN: si aparece un beacon con el NOMBRE de mi red desde una MAC que no es
 //    la mia, alerta (alguien esta copiando mi red).
-// El resto del aire es solo contexto, nunca alarma. Todo pasivo: solo escucha, nunca
-// transmite. KEY1 dispara un auto-test (simula un deauth contra mi red SIN transmitir
-// nada) para ver la alerta sin un ataque real; KEY2 es "modo aprender": fija como mi
+// El resto del aire es solo contexto, nunca alarma. La captura es pasiva; las
+// alertas se transmiten por ESP-NOW en ESPNOW_CANAL. KEY1 simula un deauth
+// local y envia su alerta, sin emitir frames de ataque; KEY2 fija como mi
 // red el BSSID que en ese momento usa mi SSID (util si el hotspot cambia de MAC, sin
-// recompilar). Sin display. Todavia no manda las alertas por ESP-NOW (eso con Placa B).
+// recompilar). Sin display; la Placa B recibe las alertas por broadcast.
 #include <stdio.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
+#include "freertos/semphr.h"
+#include "esp_log.h"
 #include "driver/gpio.h"
 #include "esp_event.h"
 #include "esp_mac.h"
@@ -26,12 +28,69 @@
 #include "nvs_flash.h"
 #include "evento.h"
 
+static const uint8_t broadcast_mac[6] = {255, 255, 255, 255, 255, 255};
+static SemaphoreHandle_t radio_mutex;
+// Disponible solo cuando no hay una transmision en vuelo. Si vence la espera,
+// el hopping sigue pausado hasta recibir el callback real del envio anterior.
+static SemaphoreHandle_t tx_idle;
+static esp_now_send_status_t tx_status;
+_Static_assert(sizeof(evento_t) == 54, "Contrato ESP-NOW incompatible");
+_Static_assert(sizeof(TEAM_TAG) - 1 == TAG_LEN, "Longitud de tag incompatible");
+
+static void sent(const esp_now_send_info_t *info, esp_now_send_status_t status)
+{
+    (void)info;
+    tx_status = status;
+    xSemaphoreGive(tx_idle);
+}
+
+static void send_alert(const evento_t *event)
+{
+    uint8_t packet[TAG_LEN + sizeof(*event)];
+    memcpy(packet, TEAM_TAG, TAG_LEN);
+    memcpy(packet + TAG_LEN, event, sizeof(*event));
+
+    xSemaphoreTake(radio_mutex, portMAX_DELAY);
+    if (xSemaphoreTake(tx_idle, pdMS_TO_TICKS(1000)) != pdTRUE) {
+        ESP_LOGE("alerta_tx", "Envio anterior pendiente; alerta omitida");
+        xSemaphoreGive(radio_mutex);
+        return;
+    }
+    uint8_t previous_channel;
+    wifi_second_chan_t previous_secondary;
+    ESP_ERROR_CHECK(esp_wifi_get_channel(&previous_channel, &previous_secondary));
+    ESP_ERROR_CHECK(esp_wifi_set_channel(ESPNOW_CANAL, WIFI_SECOND_CHAN_NONE));
+    esp_err_t err = esp_now_send(broadcast_mac, packet, sizeof(packet));
+    bool idle = true;
+    if (err != ESP_OK) {
+        ESP_LOGE("alerta_tx", "esp_now_send: %s", esp_err_to_name(err));
+        xSemaphoreGive(tx_idle);
+    } else if (xSemaphoreTake(tx_idle, pdMS_TO_TICKS(1000)) == pdTRUE) {
+        ESP_LOGI("alerta_tx", "ESP-NOW TX %s canal=%d tag=%s bytes=%u estado=%s",
+                 event->tipo == ALERTA_DEAUTH ? "DEAUTH" : "EVIL TWIN",
+                 ESPNOW_CANAL, TEAM_TAG, (unsigned)sizeof(packet),
+                 tx_status == ESP_NOW_SEND_SUCCESS ? "OK" : "ERROR");
+        xSemaphoreGive(tx_idle);
+    } else {
+        ESP_LOGE("alerta_tx", "Sin callback TX; se mantiene canal %d", ESPNOW_CANAL);
+        idle = false;
+    }
+    if (idle) {
+        ESP_ERROR_CHECK(esp_wifi_set_channel(previous_channel, previous_secondary));
+    }
+    xSemaphoreGive(radio_mutex);
+}
+
 // Deja WiFi + ESP-NOW listos, igual que espnow_chat. El orden importa: cada paso
 // necesita el anterior. NVS (la radio guarda calibracion ahi), red base, WiFi en
 // modo estacion SIN conectarse a ninguna red, canal fijo ESPNOW_CANAL, ESP-NOW.
-// En A0 todavia no manda ni recibe nada: solo confirma que la base arranca.
+// Registra el peer broadcast para transmitir a la consola B.
 static void espnow_start(void)
 {
+    radio_mutex = xSemaphoreCreateMutex();
+    tx_idle = xSemaphoreCreateBinary();
+    ESP_ERROR_CHECK(radio_mutex && tx_idle ? ESP_OK : ESP_ERR_NO_MEM);
+    xSemaphoreGive(tx_idle);
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -43,12 +102,25 @@ static void espnow_start(void)
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    const wifi_country_t country = {
+        .cc = "AR", .schan = 1, .nchan = 13, .max_tx_power = 20,
+        .policy = WIFI_COUNTRY_POLICY_MANUAL,
+    };
+    ESP_ERROR_CHECK(esp_wifi_set_country(&country));
     ESP_ERROR_CHECK(esp_wifi_set_storage(WIFI_STORAGE_RAM));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
     ESP_ERROR_CHECK(esp_wifi_start());
     ESP_ERROR_CHECK(esp_wifi_set_channel(ESPNOW_CANAL, WIFI_SECOND_CHAN_NONE));
 
     ESP_ERROR_CHECK(esp_now_init());
+    ESP_ERROR_CHECK(esp_now_register_send_cb(sent));
+    esp_now_peer_info_t peer = {
+        .channel = ESPNOW_CANAL,
+        .ifidx = WIFI_IF_STA,
+        .encrypt = false,
+    };
+    memcpy(peer.peer_addr, broadcast_mac, sizeof(broadcast_mac));
+    ESP_ERROR_CHECK(esp_now_add_peer(&peer));
 }
 
 // ---------- captura + parser 802.11 (Fase A4) ----------
@@ -262,7 +334,12 @@ static void hop_task(void *arg)
 {
     uint8_t ch = CANAL_MIN;
     while (1) {
-        ESP_ERROR_CHECK(esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE));
+        xSemaphoreTake(radio_mutex, portMAX_DELAY);
+        if (xSemaphoreTake(tx_idle, 0) == pdTRUE) {
+            ESP_ERROR_CHECK(esp_wifi_set_channel(ch, WIFI_SECOND_CHAN_NONE));
+            xSemaphoreGive(tx_idle);
+        }
+        xSemaphoreGive(radio_mutex);
         vTaskDelay(pdMS_TO_TICKS(HOP_MS));
         ch = (ch >= CANAL_MAX) ? CANAL_MIN : ch + 1;
     }
@@ -280,7 +357,7 @@ static void boton_init(void)
     ESP_ERROR_CHECK(gpio_config(&cfg));
 }
 
-// Dos botones, los dos legales (no transmiten nada):
+// Dos botones: KEY1 envia solo la alerta ESP-NOW, nunca frames de ataque:
 //  - KEY1 (auto-test): inyecta una rafaga de deauth FALSOS en el contador de "mi red"
 //    para que la alerta se dispare, y asi verla o mostrarla sin un ataque real.
 //  - KEY2 (modo aprender): fija como "mi red" el BSSID que en ese momento usa mi SSID
@@ -296,12 +373,12 @@ static void boton_task(void *arg)
         int k2 = gpio_get_level(PIN_KEY2);
 
         if (prev1 == 1 && k1 == 0) {          // KEY1: auto-test de deauth
-            printf("\n[KEY1] auto-test: simulando deauth contra mi red (sin transmitir)\n");
+            printf("\n[KEY1] auto-test: simulando deauth local; se enviara alerta ESP-NOW\n");
             taskENTER_CRITICAL(&redes_mux);
             memcpy(atk_bssid, MIS_REDES[0].bssid, 6);
             memcpy(atk_victima, victima_sim, 6);
             atk_rssi = -40;
-            atk_canal = 0;
+            atk_canal = ESPNOW_CANAL;
             taskEXIT_CRITICAL(&redes_mux);
             c_mi += 40;                       // rafaga simulada, bien por encima del umbral
         }
@@ -397,6 +474,15 @@ void app_main(void)
             canal = atk_canal;
             taskEXIT_CRITICAL(&redes_mux);
             int sev = (suma > 60) ? 3 : (suma > 20) ? 2 : 1;
+            evento_t event = {
+                .tipo = ALERTA_DEAUTH, .canal = canal, .rssi = rssi,
+                .severidad = sev,
+                .intensidad = (suma / VENTANA_SEG > UINT16_MAX) ? UINT16_MAX : suma / VENTANA_SEG,
+                .ts = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS),
+            };
+            memcpy(event.bssid, bssid, sizeof(event.bssid));
+            memcpy(event.victima, vict, sizeof(event.victima));
+            send_alert(&event);
             printf("\n*** ALERTA: DEAUTH CONTRA MI RED  sev%d  %lu en %ds ***\n",
                    sev, (unsigned long)suma, VENTANA_SEG);
             printf("    mi red  : %02x:%02x:%02x:%02x:%02x:%02x  ch%d  %d dBm\n",
@@ -424,6 +510,14 @@ void app_main(void)
                 printf("    tu red \"%s\" aparece desde OTRA MAC:\n", ssid);
                 printf("    impostor: %02x:%02x:%02x:%02x:%02x:%02x  ch%d  %d dBm\n\n",
                        bssid[0], bssid[1], bssid[2], bssid[3], bssid[4], bssid[5], canal, rssi);
+                evento_t event = {
+                    .tipo = ALERTA_EVILTWIN, .canal = canal, .rssi = rssi,
+                    .severidad = 1, .intensidad = 1,
+                    .ts = (uint32_t)(xTaskGetTickCount() * portTICK_PERIOD_MS),
+                };
+                memcpy(event.bssid, bssid, sizeof(event.bssid));
+                memcpy(event.ssid, ssid, sizeof(event.ssid));
+                send_alert(&event);
                 et_activo = true;
             }
             et_gracia = ET_GRACIA_SEG;
