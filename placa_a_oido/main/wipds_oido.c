@@ -8,9 +8,10 @@
 //  - EVIL TWIN: si aparece un beacon con el NOMBRE de mi red desde una MAC que no es
 //    la mia, alerta (alguien esta copiando mi red).
 // El resto del aire es solo contexto, nunca alarma. Todo pasivo: solo escucha, nunca
-// transmite. El boton KEY1 dispara un auto-test (simula un deauth contra mi red SIN
-// transmitir nada) para ver/mostrar la alerta sin un ataque real. Sin display.
-// Todavia no manda las alertas por ESP-NOW (eso con Placa B).
+// transmite. KEY1 dispara un auto-test (simula un deauth contra mi red SIN transmitir
+// nada) para ver la alerta sin un ataque real; KEY2 es "modo aprender": fija como mi
+// red el BSSID que en ese momento usa mi SSID (util si el hotspot cambia de MAC, sin
+// recompilar). Sin display. Todavia no manda las alertas por ESP-NOW (eso con Placa B).
 #include <stdio.h>
 #include <string.h>
 #include "freertos/FreeRTOS.h"
@@ -56,7 +57,8 @@ static void espnow_start(void)
 #define CANAL_MAX  13
 #define HOP_MS     250    // cuanto se queda escuchando cada canal
 #define MAX_REDES  32     // cuantas redes distintas recordamos para listar
-#define PIN_KEY1   14     // boton KEY1 de la placa (auto-test, ver boton_task)
+#define PIN_KEY1   14     // boton KEY1: auto-test de deauth (ver boton_task)
+#define PIN_KEY2   21     // boton KEY2: modo aprender mi red (ver boton_task)
 
 // Subtipos de frame de management que nos importan (los 4 bits de subtipo).
 #define SUB_BEACON    0x08
@@ -108,16 +110,16 @@ static int8_t  et_rssi;
 static uint8_t et_canal;
 
 // MIS_REDES: tus propias redes, con NOMBRE (SSID) y MAC del router (BSSID). El nombre
-// lo usa el detector de evil twin; la MAC, el de deauth. Leelos de las lineas "RED ..."
-// que imprime el programa y pegalos aca. Ojo: un hotspot de celu randomiza la MAC al
-// reiniciarlo; para una demo estable conviene un router de verdad (MAC fija).
+// lo usa el detector de evil twin; la MAC, el de deauth. El BSSID podes re-fijarlo en
+// caliente con KEY2 (modo aprender), util si el hotspot cambia de MAC. Por eso NO es
+// const. Para una demo estable igual conviene un router de verdad (MAC fija).
 typedef struct {
     char    ssid[SSID_MAX + 1];
     uint8_t bssid[6];
 } mi_red_t;
 
-static const mi_red_t MIS_REDES[] = {
-    {"POCO X8 Pro", {0xae, 0xd7, 0xa3, 0x65, 0xad, 0x02}},   // <-- tu red (nombre + MAC)
+static mi_red_t MIS_REDES[] = {
+    {"POCO X8 Pro", {0x62, 0xb6, 0x65, 0xba, 0x72, 0xf1}},   //  <-- tu red (nombre + MAC)
 };
 #define N_MIS_REDES  (sizeof(MIS_REDES) / sizeof(MIS_REDES[0]))
 
@@ -145,6 +147,12 @@ static bool es_evil_twin(const char *ssid, const uint8_t *bssid)
     }
     return false;
 }
+
+// Candidato para el modo aprender (KEY2): BSSID del ultimo beacon visto cuyo nombre
+// coincide con una red mia. KEY2 lo copia a MIS_REDES para re-fijar "mi red" sin
+// recompilar. cand_idx dice a cual de MIS_REDES corresponde (-1 = todavia nada).
+static int     cand_idx = -1;
+static uint8_t cand_bssid[6];
 
 // Callback del modo centinela: la radio lo llama por CADA frame 802.11. Lee el
 // frame control para sacar tipo y subtipo, y clasifica beacon/deauth/disassoc. De
@@ -205,6 +213,18 @@ static void centinela_cb(void *buf, wifi_promiscuous_pkt_type_t type_pkt)
     char ssid[SSID_MAX + 1] = {0};
     memcpy(ssid, p + 38, ssid_len);
 
+    // Modo aprender: si el beacon trae el nombre de una red mia, recordar su BSSID
+    // como candidato (KEY2 lo fija como mi red).
+    for (size_t i = 0; i < N_MIS_REDES; i++) {
+        if (strcmp(MIS_REDES[i].ssid, ssid) == 0) {
+            taskENTER_CRITICAL(&redes_mux);
+            cand_idx = (int)i;
+            memcpy(cand_bssid, bssid, 6);
+            taskEXIT_CRITICAL(&redes_mux);
+            break;
+        }
+    }
+
     // Evil twin: este beacon trae el NOMBRE de mi red pero desde otra MAC.
     if (es_evil_twin(ssid, bssid)) {
         c_evil++;
@@ -253,24 +273,29 @@ static void hop_task(void *arg)
 static void boton_init(void)
 {
     gpio_config_t cfg = {
-        .pin_bit_mask = 1ULL << PIN_KEY1,
+        .pin_bit_mask = (1ULL << PIN_KEY1) | (1ULL << PIN_KEY2),
         .mode = GPIO_MODE_INPUT,
         .pull_up_en = GPIO_PULLUP_ENABLE,
     };
     ESP_ERROR_CHECK(gpio_config(&cfg));
 }
 
-// Auto-test legal, SIN transmitir nada. Al apretar KEY1 inyecta una rafaga de deauth
-// FALSOS en el contador de "mi red", para que la alerta se dispare y puedas verla o
-// mostrarla sin un ataque real. Rellena el contexto (red = la primera de MIS_REDES,
-// victima ficticia) para que la alerta se lea bien. Detecta el flanco de apretado.
+// Dos botones, los dos legales (no transmiten nada):
+//  - KEY1 (auto-test): inyecta una rafaga de deauth FALSOS en el contador de "mi red"
+//    para que la alerta se dispare, y asi verla o mostrarla sin un ataque real.
+//  - KEY2 (modo aprender): fija como "mi red" el BSSID que en ese momento usa mi SSID
+//    (el candidato que vio el callback). Util si el hotspot cambia de MAC, sin
+//    recompilar. Apretalo cuando SOLO este tu red real (sin gemelo), asi no aprende
+//    la MAC de un impostor. Los dos detectan el flanco de apretado (1 -> 0).
 static void boton_task(void *arg)
 {
     static const uint8_t victima_sim[6] = {0x11, 0x22, 0x33, 0x44, 0x55, 0x66};
-    int prev = 1;
+    int prev1 = 1, prev2 = 1;
     while (1) {
-        int k = gpio_get_level(PIN_KEY1);
-        if (prev == 1 && k == 0) {          // recien apretado
+        int k1 = gpio_get_level(PIN_KEY1);
+        int k2 = gpio_get_level(PIN_KEY2);
+
+        if (prev1 == 1 && k1 == 0) {          // KEY1: auto-test de deauth
             printf("\n[KEY1] auto-test: simulando deauth contra mi red (sin transmitir)\n");
             taskENTER_CRITICAL(&redes_mux);
             memcpy(atk_bssid, MIS_REDES[0].bssid, 6);
@@ -278,9 +303,28 @@ static void boton_task(void *arg)
             atk_rssi = -40;
             atk_canal = 0;
             taskEXIT_CRITICAL(&redes_mux);
-            c_mi += 40;                     // rafaga simulada, bien por encima del umbral
+            c_mi += 40;                       // rafaga simulada, bien por encima del umbral
         }
-        prev = k;
+
+        if (prev2 == 1 && k2 == 0) {          // KEY2: aprender mi red
+            uint8_t b[6] = {0};
+            taskENTER_CRITICAL(&redes_mux);
+            int idx = cand_idx;
+            if (idx >= 0) {
+                memcpy(b, cand_bssid, 6);
+                memcpy(MIS_REDES[idx].bssid, b, 6);
+            }
+            taskEXIT_CRITICAL(&redes_mux);
+            if (idx >= 0) {
+                printf("\n[KEY2] aprendido: \"%s\" ahora es mi red en %02x:%02x:%02x:%02x:%02x:%02x\n\n",
+                       MIS_REDES[idx].ssid, b[0], b[1], b[2], b[3], b[4], b[5]);
+            } else {
+                printf("\n[KEY2] todavia no vi un beacon con el nombre de mi red; espera unos segundos\n\n");
+            }
+        }
+
+        prev1 = k1;
+        prev2 = k2;
         vTaskDelay(pdMS_TO_TICKS(50));
     }
 }
