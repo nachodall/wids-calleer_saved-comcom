@@ -192,6 +192,7 @@ typedef struct {
 
 static mi_red_t MIS_REDES[] = {
     {"POCO X8 Pro", {0x62, 0xb6, 0x65, 0xba, 0x72, 0xf1}},   //  <-- tu red (nombre + MAC)
+    {"WIDS-DEMO", {0x74, 0xd8, 0x3e, 0x09, 0x22, 0xac}}
 };
 #define N_MIS_REDES  (sizeof(MIS_REDES) / sizeof(MIS_REDES[0]))
 
